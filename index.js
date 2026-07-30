@@ -21,19 +21,70 @@ function log(...args) {
 }
 
 if (!WHATSAPP_TOKEN || !PHONE_NUMBER_ID || !VERIFY_TOKEN) {
-  console.error('FALTAN CREDENCIALES en el archivo .env:');
+  console.error('FALTAN CREDENCIALES:');
   console.error('  WHATSAPP_TOKEN:', WHATSAPP_TOKEN ? 'OK' : 'FALTA');
   console.error('  PHONE_NUMBER_ID:', PHONE_NUMBER_ID ? 'OK' : 'FALTA');
   console.error('  VERIFY_TOKEN:', VERIFY_TOKEN ? 'OK' : 'FALTA');
 }
 
 // =====================================================================
-// PERSISTENCIA DE SESIONES
-// Si hay DATABASE_URL usa PostgreSQL. Si no, usa memoria (solo local).
+// TEXTOS DEL FLUJO  (edita aquí para cambiar lo que dice el bot)
 // =====================================================================
 
-// Las conexiones INTERNAS de Render (host sin puntos, ej: dpg-xxxx-a) no usan SSL.
-// Las EXTERNAS (host con dominio completo) sí lo requieren.
+const TEXTOS = {
+  bienvenida:
+    '👋 ¡Hola! Gracias por contactarte con el canal de ventas de NETLIFE 🧡\n\n' +
+    'Antes de continuar, te informamos que al seguir esta conversación aceptas el tratamiento ' +
+    'de tus datos personales conforme a nuestras políticas de privacidad y tratamiento de datos.\n\n' +
+    'Puedes consultarlas aquí:\n' +
+    '📄 Política de Privacidad: https://netlife.ec/politica-privacidad/\n' +
+    '📄 Política de Tratamiento de Datos Personales: https://netlife.ec/politica-tratamiento-datos-personales/',
+
+  menuPrincipal: '👇 Por favor, indícanos el motivo de tu consulta:',
+
+  ventasTipo: '👇 Cuéntanos, ¿el servicio de internet es para?',
+
+  ventasUbicacion:
+    '📍 ¡Perfecto! Ahora ayúdanos con la siguiente información:\n\n' +
+    '🏠 Compártenos la dirección donde se instalará el servicio (calles y ciudad).\n\n' +
+    '🌐 Con esta información podremos validar la cobertura y confirmar la disponibilidad ' +
+    'del servicio en tu sector. ✅',
+
+  ventasCierre: (tipo, ubi) =>
+    '✅ *¡Perfecto! Hemos recibido tu información.*\n\n' +
+    `📶 *Tipo de servicio:*\n${tipo}\n\n` +
+    `📍 *Ubicación:*\n${ubi}\n\n` +
+    '📞 En unos minutos, uno de nuestros asesores se pondrá en contacto contigo mediante ' +
+    'una llamada para continuar con el proceso.\n\n' +
+    '🙏 Por favor, mantente atento a tu teléfono.',
+
+  sacMenu: '👇 Cuéntanos, ¿cuál es tu requerimiento?',
+
+  sacCierre: (req) =>
+    `✅ Hemos registrado tu requerimiento: *${req}*.\n\n` +
+    '📞 Un asesor de NETLIFE se comunicará contigo en breve.\n\n' +
+    '🙏 Gracias por tu paciencia.',
+};
+
+const OPC_VENTAS = {
+  vt_hogar: 'Hogar',
+  vt_oficina: 'Oficinas / PYMES',
+  vt_adulto: 'Adulto Mayor',
+};
+
+const OPC_SAC = {
+  sac_asesor: 'Contactar a un asesor',
+  sac_producto: 'Adquirir un producto adicional',
+  sac_facturas: 'Consulta de facturas',
+  sac_soporte: 'Soporte Técnico',
+  sac_reclamo: 'Presentar un Reclamo',
+};
+
+// =====================================================================
+// BASE DE DATOS
+// =====================================================================
+
+// Las conexiones INTERNAS de Render (host sin puntos) no usan SSL.
 function configSsl(url) {
   try {
     const host = new URL(url).hostname;
@@ -44,21 +95,19 @@ function configSsl(url) {
 }
 
 const pool = DATABASE_URL
-  ? new Pool({
-      connectionString: DATABASE_URL,
-      ssl: configSsl(DATABASE_URL),
-    })
+  ? new Pool({ connectionString: DATABASE_URL, ssl: configSsl(DATABASE_URL) })
   : null;
 
-const memoria = {}; // respaldo si no hay base de datos
+const memoria = {};
 
 async function initDb() {
   if (!pool) {
-    log('Sin DATABASE_URL: las sesiones se guardan en memoria (solo para pruebas locales).');
+    log('Sin DATABASE_URL: sesiones en memoria (solo pruebas locales).');
     return;
   }
-  // Esquema propio para no mezclarse con las tablas del ERP
   await pool.query('CREATE SCHEMA IF NOT EXISTS bot;');
+
+  // Estado de conversaciones EN CURSO (se borra al terminar el flujo)
   await pool.query(`
     CREATE TABLE IF NOT EXISTS bot.whatsapp_sesiones (
       telefono    TEXT PRIMARY KEY,
@@ -67,7 +116,36 @@ async function initDb() {
       actualizado TIMESTAMPTZ NOT NULL DEFAULT now()
     );
   `);
-  log('PostgreSQL conectado. Tabla bot.whatsapp_sesiones lista.');
+
+  // Solicitudes completadas: esto es lo que revisa el equipo comercial
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS bot.leads (
+      id            SERIAL PRIMARY KEY,
+      telefono      TEXT NOT NULL,
+      canal         TEXT NOT NULL,
+      tipo_internet TEXT,
+      ubicacion     TEXT,
+      requerimiento TEXT,
+      creado        TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+  `);
+
+  // Historial completo de mensajes (respaldo de los chats)
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS bot.mensajes (
+      id        BIGSERIAL PRIMARY KEY,
+      telefono  TEXT NOT NULL,
+      direccion TEXT NOT NULL,
+      tipo      TEXT,
+      contenido TEXT,
+      creado    TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+  `);
+  await pool.query(
+    'CREATE INDEX IF NOT EXISTS idx_mensajes_telefono ON bot.mensajes (telefono, creado DESC);'
+  );
+
+  log('PostgreSQL conectado. Tablas listas: whatsapp_sesiones, leads, mensajes.');
 }
 
 async function cargarSesion(telefono) {
@@ -92,9 +170,7 @@ async function guardarSesion(telefono, sesion) {
     `INSERT INTO bot.whatsapp_sesiones (telefono, estado, datos, actualizado)
      VALUES ($1, $2, $3, now())
      ON CONFLICT (telefono) DO UPDATE
-       SET estado = EXCLUDED.estado,
-           datos = EXCLUDED.datos,
-           actualizado = now()`,
+       SET estado = EXCLUDED.estado, datos = EXCLUDED.datos, actualizado = now()`,
     [telefono, sesion.state, JSON.stringify(sesion.data || {})]
   );
 }
@@ -107,11 +183,36 @@ async function borrarSesion(telefono) {
   await pool.query('DELETE FROM bot.whatsapp_sesiones WHERE telefono = $1', [telefono]);
 }
 
+async function guardarLead(lead) {
+  if (!pool) {
+    log('    (sin BD) LEAD:', JSON.stringify(lead));
+    return;
+  }
+  await pool.query(
+    `INSERT INTO bot.leads (telefono, canal, tipo_internet, ubicacion, requerimiento)
+     VALUES ($1, $2, $3, $4, $5)`,
+    [lead.telefono, lead.canal, lead.tipo_internet || null, lead.ubicacion || null, lead.requerimiento || null]
+  );
+  log('    LEAD GUARDADO:', JSON.stringify(lead));
+}
+
+async function guardarMensaje(telefono, direccion, tipo, contenido) {
+  if (!pool) return;
+  try {
+    await pool.query(
+      'INSERT INTO bot.mensajes (telefono, direccion, tipo, contenido) VALUES ($1,$2,$3,$4)',
+      [telefono, direccion, tipo, contenido]
+    );
+  } catch (e) {
+    console.error('Error guardando mensaje:', e.message);
+  }
+}
+
 // =====================================================================
-// ENVÍO DE MENSAJES A WHATSAPP
+// ENVÍO A WHATSAPP
 // =====================================================================
 
-async function sendMessage(payload) {
+async function sendMessage(payload, resumen) {
   const res = await fetch(GRAPH_URL, {
     method: 'POST',
     headers: {
@@ -125,115 +226,99 @@ async function sendMessage(payload) {
     console.error('>>> ERROR AL ENVIAR:', JSON.stringify(json.error, null, 2));
   } else {
     log('>>> ENVIADO OK a', payload.to, '| tipo:', payload.type);
+    await guardarMensaje(payload.to, 'saliente', payload.type, resumen);
   }
   return json;
 }
 
 function sendText(to, body) {
-  return sendMessage({
-    messaging_product: 'whatsapp',
-    to,
-    type: 'text',
-    text: { body },
-  });
+  return sendMessage(
+    { messaging_product: 'whatsapp', to, type: 'text', text: { body, preview_url: false } },
+    body
+  );
 }
 
 function sendButtons(to, bodyText, buttons) {
-  return sendMessage({
-    messaging_product: 'whatsapp',
-    to,
-    type: 'interactive',
-    interactive: {
-      type: 'button',
-      body: { text: bodyText },
-      action: {
-        buttons: buttons.map((b) => ({
-          type: 'reply',
-          reply: { id: b.id, title: b.title },
-        })),
+  return sendMessage(
+    {
+      messaging_product: 'whatsapp',
+      to,
+      type: 'interactive',
+      interactive: {
+        type: 'button',
+        body: { text: bodyText },
+        action: {
+          buttons: buttons.map((b) => ({
+            type: 'reply',
+            reply: { id: b.id, title: b.title },
+          })),
+        },
       },
     },
-  });
+    `${bodyText} [${buttons.map((b) => b.title).join(' | ')}]`
+  );
 }
 
 function sendList(to, bodyText, buttonText, rows) {
-  return sendMessage({
-    messaging_product: 'whatsapp',
-    to,
-    type: 'interactive',
-    interactive: {
-      type: 'list',
-      body: { text: bodyText },
-      action: {
-        button: buttonText,
-        sections: [{ title: 'Opciones', rows }],
+  return sendMessage(
+    {
+      messaging_product: 'whatsapp',
+      to,
+      type: 'interactive',
+      interactive: {
+        type: 'list',
+        body: { text: bodyText },
+        action: { button: buttonText, sections: [{ title: 'Opciones', rows }] },
       },
     },
-  });
+    `${bodyText} [${rows.map((r) => r.title).join(' | ')}]`
+  );
 }
 
 // =====================================================================
 // RUTAS
 // =====================================================================
 
-app.get('/', (req, res) => {
-  res.send('Bot activo. Todo OK.');
-});
+app.get('/', (req, res) => res.send('Bot activo. Todo OK.'));
 
-// Verificación del webhook (Meta la llama por GET al configurar)
 app.get('/webhook', (req, res) => {
   log('<<< GET /webhook (verificacion de Meta)');
   const mode = req.query['hub.mode'];
   const token = req.query['hub.verify_token'];
   const challenge = req.query['hub.challenge'];
-
-  if (mode === 'subscribe' && token === VERIFY_TOKEN) {
-    return res.status(200).send(challenge);
-  }
+  if (mode === 'subscribe' && token === VERIFY_TOKEN) return res.status(200).send(challenge);
   return res.sendStatus(403);
 });
 
-// Recepción de mensajes entrantes
 app.post('/webhook', async (req, res) => {
-  res.sendStatus(200); // Meta espera un 200 rápido, procesamos después
+  res.sendStatus(200);
 
   try {
-    log('<<< POST /webhook recibido:');
-    console.log(JSON.stringify(req.body, null, 2));
-
-    const entry = req.body.entry?.[0];
-    const change = entry?.changes?.[0];
-    const value = change?.value;
-    const message = value?.messages?.[0];
-    if (!message) {
-      log('    (sin mensaje: es una notificacion de estado, se ignora)');
-      return;
-    }
+    const message = req.body.entry?.[0]?.changes?.[0]?.value?.messages?.[0];
+    if (!message) return;
 
     const from = message.from;
     const session = await cargarSesion(from);
-    log(`    Mensaje de ${from} | tipo: ${message.type} | estado actual: ${session.state}`);
 
     let selection = null;
     if (message.type === 'text') {
       selection = message.text.body.trim();
     } else if (message.type === 'interactive') {
-      if (message.interactive.type === 'button_reply') {
-        selection = message.interactive.button_reply.id;
-      } else if (message.interactive.type === 'list_reply') {
-        selection = message.interactive.list_reply.id;
-      }
+      if (message.interactive.type === 'button_reply') selection = message.interactive.button_reply.id;
+      else if (message.interactive.type === 'list_reply') selection = message.interactive.list_reply.id;
     } else if (message.type === 'location') {
       const loc = message.location;
       selection = `${loc.latitude}, ${loc.longitude}${loc.address ? ' - ' + loc.address : ''}`;
     }
 
-    log(`    Seleccion detectada: "${selection}"`);
+    log(`<<< ${from} | tipo: ${message.type} | estado: ${session.state} | eligio: "${selection}"`);
+    await guardarMensaje(from, 'entrante', message.type, selection);
+
     await handleMessage(from, session, selection);
 
     if (session.ended) {
       await borrarSesion(from);
-      log('    Conversacion finalizada, sesion borrada.');
+      log('    Flujo terminado, sesion borrada.');
     } else {
       await guardarSesion(from, session);
       log(`    Sesion guardada | nuevo estado: ${session.state}`);
@@ -244,101 +329,98 @@ app.post('/webhook', async (req, res) => {
 });
 
 // =====================================================================
-// LÓGICA DE LA CONVERSACIÓN
+// FLUJO DE CONVERSACIÓN
 // =====================================================================
 
 async function handleMessage(from, session, selection) {
-  log(`    -> handleMessage | estado: ${session.state}`);
   switch (session.state) {
+    // -------- Bienvenida + menú principal --------
     case 'START': {
-      await sendButtons(
-        from,
-        'Hola! bienvenido al Canal de Ventas Netlife, para darte mayor atención a tu requerimiento al seguir en la conversación aceptas nuestra política de protección de datos.',
-        [
-          { id: 'menu_sac', title: 'Servicio al Cliente' },
-          { id: 'menu_ventas', title: 'Canal de Ventas' },
-        ]
-      );
-      session.state = 'MAIN_MENU';
+      await sendText(from, TEXTOS.bienvenida);
+      await sendButtons(from, TEXTOS.menuPrincipal, [
+        { id: 'menu_ventas', title: '💰 Ventas' },
+        { id: 'menu_sac', title: 'Servicio al Cliente' },
+      ]);
+      session.state = 'MENU_PRINCIPAL';
       break;
     }
 
-    case 'MAIN_MENU': {
-      if (selection === 'menu_sac') {
-        await sendList(
-          from,
-          'Para poder entender tu novedad, por favor selecciona cuál es tu requerimiento:',
-          'Ver opciones',
-          [
-            { id: 'sac_facturacion', title: 'Facturación' },
-            { id: 'sac_sin_servicio', title: 'Sin servicio' },
-            { id: 'sac_soporte', title: 'Soporte técnico' },
-            { id: 'sac_nuevo_servicio', title: 'Adquirir nuevo servicio' },
-            { id: 'sac_asesor', title: 'Hablar con un asesor' },
-          ]
-        );
-        session.state = 'SAC_LIST';
-      } else if (selection === 'menu_ventas') {
-        await sendText(from, 'Por favor, ¿cuál es su nombre?');
-        session.state = 'VENTAS_ASK_NAME';
+    case 'MENU_PRINCIPAL': {
+      if (selection === 'menu_ventas') {
+        await sendButtons(from, TEXTOS.ventasTipo, [
+          { id: 'vt_hogar', title: 'Hogar' },
+          { id: 'vt_oficina', title: 'Oficinas / PYMES' },
+          { id: 'vt_adulto', title: 'Adulto Mayor' },
+        ]);
+        session.state = 'VENTAS_TIPO';
+      } else if (selection === 'menu_sac') {
+        await sendList(from, TEXTOS.sacMenu, 'Ver opciones', [
+          { id: 'sac_asesor', title: 'Contactar a un asesor' },
+          { id: 'sac_producto', title: 'Producto adicional', description: 'Adquirir un producto adicional' },
+          { id: 'sac_facturas', title: 'Consulta de facturas' },
+          { id: 'sac_soporte', title: 'Soporte Técnico' },
+          { id: 'sac_reclamo', title: 'Presentar un Reclamo' },
+        ]);
+        session.state = 'SAC_MENU';
       } else {
-        // No eligió un botón: se le vuelve a mostrar el menú
-        session.state = 'START';
-        await handleMessage(from, session, null);
+        // No eligió una opción válida: se repite el menú
+        await sendButtons(from, TEXTOS.menuPrincipal, [
+          { id: 'menu_ventas', title: '💰 Ventas' },
+          { id: 'menu_sac', title: 'Servicio al Cliente' },
+        ]);
       }
       break;
     }
 
-    case 'SAC_LIST': {
-      const labels = {
-        sac_facturacion: 'Facturación',
-        sac_sin_servicio: 'Sin servicio',
-        sac_soporte: 'Soporte técnico',
-        sac_nuevo_servicio: 'Adquirir nuevo servicio',
-        sac_asesor: 'Hablar con un asesor',
-      };
-      const label = labels[selection] || selection;
-      await sendText(
-        from,
-        `Gracias, registramos tu solicitud sobre "${label}". Un asesor la revisará en breve.`
-      );
+    // -------- Rama VENTAS --------
+    case 'VENTAS_TIPO': {
+      const tipo = OPC_VENTAS[selection];
+      if (!tipo) {
+        await sendButtons(from, TEXTOS.ventasTipo, [
+          { id: 'vt_hogar', title: 'Hogar' },
+          { id: 'vt_oficina', title: 'Oficinas / PYMES' },
+          { id: 'vt_adulto', title: 'Adulto Mayor' },
+        ]);
+        break;
+      }
+      session.data.tipo_internet = tipo;
+      await sendText(from, TEXTOS.ventasUbicacion);
+      session.state = 'VENTAS_UBICACION';
+      break;
+    }
+
+    case 'VENTAS_UBICACION': {
+      if (!selection) {
+        await sendText(from, TEXTOS.ventasUbicacion);
+        break;
+      }
+      session.data.ubi = selection;
+      await sendText(from, TEXTOS.ventasCierre(session.data.tipo_internet, session.data.ubi));
+      await guardarLead({
+        telefono: from,
+        canal: 'ventas',
+        tipo_internet: session.data.tipo_internet,
+        ubicacion: session.data.ubi,
+      });
       session.ended = true;
       break;
     }
 
-    case 'VENTAS_ASK_NAME': {
-      session.data.nombre = selection;
-      await sendButtons(from, 'El servicio es para:', [
-        { id: 'tipo_hogar', title: 'HOGAR' },
-        { id: 'tipo_oficina', title: 'OFICINAS / PYMES' },
-        { id: 'tipo_adulto_mayor', title: 'ADULTO MAYOR' },
-      ]);
-      session.state = 'VENTAS_ASK_TYPE';
-      break;
-    }
-
-    case 'VENTAS_ASK_TYPE': {
-      const labels = {
-        tipo_hogar: 'HOGAR',
-        tipo_oficina: 'OFICINAS / PYMES',
-        tipo_adulto_mayor: 'ADULTO MAYOR',
-      };
-      session.data.tipo = labels[selection] || selection;
-      await sendText(
-        from,
-        'Por favor ayúdeme con la ubicación o dirección donde va a instalar el servicio, para validar cobertura.'
-      );
-      session.state = 'VENTAS_ASK_LOCATION';
-      break;
-    }
-
-    case 'VENTAS_ASK_LOCATION': {
-      session.data.ubicacion = selection;
-      await sendText(
-        from,
-        `¡Gracias, ${session.data.nombre}! Registramos tu solicitud para ${session.data.tipo}. Un asesor revisará tu ubicación y continuará contigo.`
-      );
-      log('    LEAD COMPLETO:', JSON.stringify(session.data));
+    // -------- Rama SERVICIO AL CLIENTE --------
+    case 'SAC_MENU': {
+      const req = OPC_SAC[selection];
+      if (!req) {
+        await sendList(from, TEXTOS.sacMenu, 'Ver opciones', [
+          { id: 'sac_asesor', title: 'Contactar a un asesor' },
+          { id: 'sac_producto', title: 'Producto adicional', description: 'Adquirir un producto adicional' },
+          { id: 'sac_facturas', title: 'Consulta de facturas' },
+          { id: 'sac_soporte', title: 'Soporte Técnico' },
+          { id: 'sac_reclamo', title: 'Presentar un Reclamo' },
+        ]);
+        break;
+      }
+      await sendText(from, TEXTOS.sacCierre(req));
+      await guardarLead({ telefono: from, canal: 'servicio', requerimiento: req });
       session.ended = true;
       break;
     }
