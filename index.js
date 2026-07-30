@@ -32,10 +32,21 @@ if (!WHATSAPP_TOKEN || !PHONE_NUMBER_ID || !VERIFY_TOKEN) {
 // Si hay DATABASE_URL usa PostgreSQL. Si no, usa memoria (solo local).
 // =====================================================================
 
+// Las conexiones INTERNAS de Render (host sin puntos, ej: dpg-xxxx-a) no usan SSL.
+// Las EXTERNAS (host con dominio completo) sí lo requieren.
+function configSsl(url) {
+  try {
+    const host = new URL(url).hostname;
+    return host.includes('.') ? { rejectUnauthorized: false } : false;
+  } catch {
+    return false;
+  }
+}
+
 const pool = DATABASE_URL
   ? new Pool({
       connectionString: DATABASE_URL,
-      ssl: { rejectUnauthorized: false },
+      ssl: configSsl(DATABASE_URL),
     })
   : null;
 
@@ -46,15 +57,17 @@ async function initDb() {
     log('Sin DATABASE_URL: las sesiones se guardan en memoria (solo para pruebas locales).');
     return;
   }
+  // Esquema propio para no mezclarse con las tablas del ERP
+  await pool.query('CREATE SCHEMA IF NOT EXISTS bot;');
   await pool.query(`
-    CREATE TABLE IF NOT EXISTS whatsapp_sesiones (
+    CREATE TABLE IF NOT EXISTS bot.whatsapp_sesiones (
       telefono    TEXT PRIMARY KEY,
       estado      TEXT NOT NULL,
       datos       JSONB NOT NULL DEFAULT '{}'::jsonb,
       actualizado TIMESTAMPTZ NOT NULL DEFAULT now()
     );
   `);
-  log('PostgreSQL conectado. Tabla whatsapp_sesiones lista.');
+  log('PostgreSQL conectado. Tabla bot.whatsapp_sesiones lista.');
 }
 
 async function cargarSesion(telefono) {
@@ -63,7 +76,7 @@ async function cargarSesion(telefono) {
     return memoria[telefono];
   }
   const r = await pool.query(
-    'SELECT estado, datos FROM whatsapp_sesiones WHERE telefono = $1',
+    'SELECT estado, datos FROM bot.whatsapp_sesiones WHERE telefono = $1',
     [telefono]
   );
   if (r.rows.length === 0) return { state: 'START', data: {} };
@@ -76,7 +89,7 @@ async function guardarSesion(telefono, sesion) {
     return;
   }
   await pool.query(
-    `INSERT INTO whatsapp_sesiones (telefono, estado, datos, actualizado)
+    `INSERT INTO bot.whatsapp_sesiones (telefono, estado, datos, actualizado)
      VALUES ($1, $2, $3, now())
      ON CONFLICT (telefono) DO UPDATE
        SET estado = EXCLUDED.estado,
@@ -91,7 +104,7 @@ async function borrarSesion(telefono) {
     delete memoria[telefono];
     return;
   }
-  await pool.query('DELETE FROM whatsapp_sesiones WHERE telefono = $1', [telefono]);
+  await pool.query('DELETE FROM bot.whatsapp_sesiones WHERE telefono = $1', [telefono]);
 }
 
 // =====================================================================
