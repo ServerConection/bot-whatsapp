@@ -148,16 +148,26 @@ async function initDb() {
   log('PostgreSQL conectado. Tablas listas: whatsapp_sesiones, leads, mensajes.');
 }
 
+// Si una conversación queda abandonada, después de estas horas se descarta
+// y el cliente arranca de nuevo desde la bienvenida.
+const HORAS_CADUCIDAD = 6;
+
 async function cargarSesion(telefono) {
   if (!pool) {
     if (!memoria[telefono]) memoria[telefono] = { state: 'START', data: {} };
     return memoria[telefono];
   }
   const r = await pool.query(
-    'SELECT estado, datos FROM bot.whatsapp_sesiones WHERE telefono = $1',
+    `SELECT estado, datos,
+            (actualizado < now() - INTERVAL '${HORAS_CADUCIDAD} hours') AS vencida
+     FROM bot.whatsapp_sesiones WHERE telefono = $1`,
     [telefono]
   );
   if (r.rows.length === 0) return { state: 'START', data: {} };
+  if (r.rows[0].vencida) {
+    log('    Sesion vencida por inactividad, se reinicia el flujo.');
+    return { state: 'START', data: {} };
+  }
   return { state: r.rows[0].estado, data: r.rows[0].datos || {} };
 }
 
@@ -313,6 +323,17 @@ app.post('/webhook', async (req, res) => {
 
     log(`<<< ${from} | tipo: ${message.type} | estado: ${session.state} | eligio: "${selection}"`);
     await guardarMensaje(from, 'entrante', message.type, selection);
+
+    // Palabras que reinician la conversación desde cualquier punto
+    const PALABRAS_REINICIO = ['menu', 'menú', 'inicio', 'hola', 'reiniciar', 'empezar'];
+    if (
+      message.type === 'text' &&
+      PALABRAS_REINICIO.includes((selection || '').toLowerCase().trim())
+    ) {
+      log('    Palabra de reinicio detectada, vuelve al inicio.');
+      session.state = 'START';
+      session.data = {};
+    }
 
     await handleMessage(from, session, selection);
 
