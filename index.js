@@ -151,13 +151,34 @@ async function initDb() {
   await pool.query(
     'CREATE INDEX IF NOT EXISTS idx_mensajes_telefono ON bot.mensajes (telefono, creado DESC);'
   );
+  // ID que WhatsApp asigna a cada mensaje: sirve para reconocer nuestros propios envíos
+  await pool.query('ALTER TABLE bot.mensajes ADD COLUMN IF NOT EXISTS wamid TEXT;');
+  await pool.query(
+    'CREATE INDEX IF NOT EXISTS idx_mensajes_wamid ON bot.mensajes (wamid);'
+  );
 
-  log('PostgreSQL conectado. Tablas listas: whatsapp_sesiones, leads, mensajes.');
+  // Números para los que el bot debe permanecer callado
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS bot.pausas (
+      telefono      TEXT PRIMARY KEY,
+      pausado_hasta TIMESTAMPTZ NOT NULL,
+      motivo        TEXT,
+      actualizado   TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+  `);
+
+  log('PostgreSQL conectado. Tablas listas: whatsapp_sesiones, leads, mensajes, pausas.');
 }
 
 // Si una conversación queda abandonada, después de estas horas se descarta
 // y el cliente arranca de nuevo desde la bienvenida.
 const HORAS_CADUCIDAD = 6;
+
+// Cuánto se calla el bot cuando un asesor humano interviene
+const HORAS_PAUSA_ASESOR = 24;
+
+// Cuánto se calla el bot después de que el cliente termina el flujo
+const DIAS_PAUSA_FIN_FLUJO = 20;
 
 async function cargarSesion(telefono) {
   if (!pool) {
@@ -211,19 +232,59 @@ async function guardarLead(lead) {
     [lead.telefono, lead.canal, lead.tipo_internet || null, lead.ubicacion || null, lead.requerimiento || null]
   );
   log('    LEAD GUARDADO:', JSON.stringify(lead));
+  // El cliente terminó el flujo: el bot se calla y deja el caso al asesor
+  await pausar(lead.telefono, `${DIAS_PAUSA_FIN_FLUJO} days`, 'flujo completado');
   await dispararWebhook(lead);
 }
 
-async function guardarMensaje(telefono, direccion, tipo, contenido) {
+async function guardarMensaje(telefono, direccion, tipo, contenido, wamid = null) {
   if (!pool) return;
   try {
     await pool.query(
-      'INSERT INTO bot.mensajes (telefono, direccion, tipo, contenido) VALUES ($1,$2,$3,$4)',
-      [telefono, direccion, tipo, contenido]
+      'INSERT INTO bot.mensajes (telefono, direccion, tipo, contenido, wamid) VALUES ($1,$2,$3,$4,$5)',
+      [telefono, direccion, tipo, contenido, wamid]
     );
   } catch (e) {
     console.error('Error guardando mensaje:', e.message);
   }
+}
+
+// =====================================================================
+// PAUSAS DEL BOT
+// =====================================================================
+
+// Devuelve la fecha hasta la que el bot debe callarse, o null si puede hablar
+async function pausaActiva(telefono) {
+  if (!pool) return null;
+  const r = await pool.query(
+    'SELECT pausado_hasta, motivo FROM bot.pausas WHERE telefono = $1 AND pausado_hasta > now()',
+    [telefono]
+  );
+  return r.rows[0] || null;
+}
+
+async function pausar(telefono, intervalo, motivo) {
+  if (!pool) return;
+  await pool.query(
+    `INSERT INTO bot.pausas (telefono, pausado_hasta, motivo, actualizado)
+     VALUES ($1, now() + $2::interval, $3, now())
+     ON CONFLICT (telefono) DO UPDATE
+       SET pausado_hasta = EXCLUDED.pausado_hasta,
+           motivo = EXCLUDED.motivo,
+           actualizado = now()`,
+    [telefono, intervalo, motivo]
+  );
+  log(`    BOT PAUSADO para ${telefono} por ${intervalo} (${motivo})`);
+}
+
+// ¿Ese ID de mensaje lo envió nuestro bot?
+async function esMensajeDelBot(wamid) {
+  if (!pool || !wamid) return false;
+  const r = await pool.query(
+    "SELECT 1 FROM bot.mensajes WHERE wamid = $1 AND direccion = 'saliente' LIMIT 1",
+    [wamid]
+  );
+  return r.rows.length > 0;
 }
 
 // =====================================================================
@@ -243,8 +304,11 @@ async function sendMessage(payload, resumen) {
   if (json.error) {
     console.error('>>> ERROR AL ENVIAR:', JSON.stringify(json.error, null, 2));
   } else {
+    const wamid = json.messages?.[0]?.id || null;
     log('>>> ENVIADO OK a', payload.to, '| tipo:', payload.type);
-    await guardarMensaje(payload.to, 'saliente', payload.type, resumen);
+    // Guardamos el wamid para poder reconocer este mensaje como propio
+    // cuando WhatsApp nos devuelva el eco.
+    await guardarMensaje(payload.to, 'saliente', payload.type, resumen, wamid);
   }
   return json;
 }
@@ -341,10 +405,45 @@ app.post('/webhook', async (req, res) => {
   res.sendStatus(200);
 
   try {
-    const message = req.body.entry?.[0]?.changes?.[0]?.value?.messages?.[0];
+    const value = req.body.entry?.[0]?.changes?.[0]?.value;
+
+    // ---- ECO: copia de un mensaje que SALIÓ desde nuestro número ----
+    // Si el ID no corresponde a un envío del bot, lo escribió un asesor humano.
+    const eco = value?.message_echoes?.[0];
+    if (eco) {
+      const cliente = eco.to;
+      const propio = await esMensajeDelBot(eco.id);
+      if (propio) {
+        log(`<<< eco de mensaje propio (${eco.id}), se ignora`);
+      } else {
+        log(`<<< ECO DE ASESOR HUMANO hacia ${cliente}`);
+        const texto = eco.text?.body || `[${eco.type}]`;
+        await guardarMensaje(cliente, 'asesor', eco.type, texto, eco.id);
+        await pausar(cliente, `${HORAS_PAUSA_ASESOR} hours`, 'intervencion de asesor');
+        await borrarSesion(cliente); // el asesor toma el control
+      }
+      return;
+    }
+
+    const message = value?.messages?.[0];
     if (!message) return;
 
     const from = message.from;
+
+    // ---- ¿El bot está en pausa para este número? ----
+    const pausa = await pausaActiva(from);
+    if (pausa) {
+      const hasta = new Date(pausa.pausado_hasta).toLocaleString('es-EC');
+      log(`<<< ${from} escribio, pero el BOT ESTA PAUSADO hasta ${hasta} (${pausa.motivo}). No se responde.`);
+      await guardarMensaje(
+        from,
+        'entrante',
+        message.type,
+        message.text?.body || `[${message.type}]`
+      );
+      return;
+    }
+
     const session = await cargarSesion(from);
 
     let selection = null;

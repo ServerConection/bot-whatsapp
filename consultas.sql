@@ -94,7 +94,31 @@ LEFT JOIN bot.leads l ON l.telefono = m.telefono
 WHERE l.id IS NULL;
 
 -- ---------------------------------------------------------------------
--- 4. CONVERSACIONES EN CURSO (diagnóstico)
+-- 4. PAUSAS DEL BOT
+-- ---------------------------------------------------------------------
+
+-- Números en los que el bot está callado ahora mismo
+SELECT telefono, motivo, pausado_hasta,
+       pausado_hasta - now() AS tiempo_restante
+FROM bot.pausas
+WHERE pausado_hasta > now()
+ORDER BY pausado_hasta;
+
+-- Reactivar el bot para un número específico (quitar la pausa)
+DELETE FROM bot.pausas WHERE telefono = '593958693149';
+
+-- Reactivar el bot para TODOS (usar con cuidado)
+DELETE FROM bot.pausas;
+
+-- Cuántas veces intervino un asesor por día
+SELECT creado::date AS dia, COUNT(*) AS intervenciones
+FROM bot.mensajes
+WHERE direccion = 'asesor'
+GROUP BY dia
+ORDER BY dia DESC;
+
+-- ---------------------------------------------------------------------
+-- 5. CONVERSACIONES EN CURSO (diagnóstico)
 -- ---------------------------------------------------------------------
 
 -- Quién está a mitad del flujo en este momento
