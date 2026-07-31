@@ -66,19 +66,26 @@ const TEXTOS = {
     '🙏 Gracias por tu paciencia.',
 };
 
+// Opciones de "Quiero Contratar" (lista: máx 24 caracteres por título)
 const OPC_VENTAS = {
-  vt_hogar: 'Hogar',
-  vt_oficina: 'Oficinas / PYMES',
+  vt_hogar: 'Internet Hogar / Gamer',
+  vt_empresa: 'Empresas / PYMES',
   vt_adulto: 'Adulto Mayor',
 };
 
+// Opciones de "Servicio al Cliente" (lista: máx 24 caracteres por título)
 const OPC_SAC = {
-  sac_asesor: 'Contactar a un asesor',
-  sac_producto: 'Adquirir un producto adicional',
-  sac_facturas: 'Consulta de facturas',
+  sac_contratar: 'Contratar un servicio',
+  sac_cancelar: 'Cancelar un servicio',
+  sac_traslado: 'Traslado',
   sac_soporte: 'Soporte Técnico',
-  sac_reclamo: 'Presentar un Reclamo',
+  sac_facturacion: 'Facturación',
 };
+
+// Construye las filas de lista a partir de los objetos de arriba
+function filas(opciones) {
+  return Object.entries(opciones).map(([id, title]) => ({ id, title }));
+}
 
 // =====================================================================
 // BASE DE DATOS
@@ -204,6 +211,7 @@ async function guardarLead(lead) {
     [lead.telefono, lead.canal, lead.tipo_internet || null, lead.ubicacion || null, lead.requerimiento || null]
   );
   log('    LEAD GUARDADO:', JSON.stringify(lead));
+  await dispararWebhook(lead);
 }
 
 async function guardarMensaje(telefono, direccion, tipo, contenido) {
@@ -285,6 +293,35 @@ function sendList(to, bodyText, buttonText, rows) {
   );
 }
 
+// Menú principal (se reutiliza al inicio y cuando el cliente no elige bien)
+function menuPrincipal(to) {
+  return sendButtons(to, TEXTOS.menuPrincipal, [
+    { id: 'menu_ventas', title: 'Quiero Contratar' },
+    { id: 'menu_sac', title: 'Servicio al Cliente' },
+  ]);
+}
+
+// =====================================================================
+// WEBHOOK DE SALIDA (Bitrix u otro sistema)
+// Se dispara cuando una conversación se completa.
+// Si WEBHOOK_URL no está configurada, simplemente no hace nada.
+// =====================================================================
+
+async function dispararWebhook(lead) {
+  const url = process.env.WEBHOOK_URL;
+  if (!url) return;
+  try {
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(lead),
+    });
+    log(`>>> WEBHOOK enviado (${res.status}):`, JSON.stringify(lead));
+  } catch (e) {
+    console.error('>>> ERROR enviando webhook:', e.message);
+  }
+}
+
 // =====================================================================
 // RUTAS
 // =====================================================================
@@ -358,50 +395,30 @@ async function handleMessage(from, session, selection) {
     // -------- Bienvenida + menú principal --------
     case 'START': {
       await sendText(from, TEXTOS.bienvenida);
-      await sendButtons(from, TEXTOS.menuPrincipal, [
-        { id: 'menu_ventas', title: '💰 Ventas' },
-        { id: 'menu_sac', title: 'Servicio al Cliente' },
-      ]);
+      await menuPrincipal(from);
       session.state = 'MENU_PRINCIPAL';
       break;
     }
 
     case 'MENU_PRINCIPAL': {
       if (selection === 'menu_ventas') {
-        await sendButtons(from, TEXTOS.ventasTipo, [
-          { id: 'vt_hogar', title: 'Hogar' },
-          { id: 'vt_oficina', title: 'Oficinas / PYMES' },
-          { id: 'vt_adulto', title: 'Adulto Mayor' },
-        ]);
+        await sendList(from, TEXTOS.ventasTipo, 'Ver opciones', filas(OPC_VENTAS));
         session.state = 'VENTAS_TIPO';
       } else if (selection === 'menu_sac') {
-        await sendList(from, TEXTOS.sacMenu, 'Ver opciones', [
-          { id: 'sac_asesor', title: 'Contactar a un asesor' },
-          { id: 'sac_producto', title: 'Producto adicional', description: 'Adquirir un producto adicional' },
-          { id: 'sac_facturas', title: 'Consulta de facturas' },
-          { id: 'sac_soporte', title: 'Soporte Técnico' },
-          { id: 'sac_reclamo', title: 'Presentar un Reclamo' },
-        ]);
+        await sendList(from, TEXTOS.sacMenu, 'Ver opciones', filas(OPC_SAC));
         session.state = 'SAC_MENU';
       } else {
         // No eligió una opción válida: se repite el menú
-        await sendButtons(from, TEXTOS.menuPrincipal, [
-          { id: 'menu_ventas', title: '💰 Ventas' },
-          { id: 'menu_sac', title: 'Servicio al Cliente' },
-        ]);
+        await menuPrincipal(from);
       }
       break;
     }
 
-    // -------- Rama VENTAS --------
+    // -------- Rama QUIERO CONTRATAR --------
     case 'VENTAS_TIPO': {
       const tipo = OPC_VENTAS[selection];
       if (!tipo) {
-        await sendButtons(from, TEXTOS.ventasTipo, [
-          { id: 'vt_hogar', title: 'Hogar' },
-          { id: 'vt_oficina', title: 'Oficinas / PYMES' },
-          { id: 'vt_adulto', title: 'Adulto Mayor' },
-        ]);
+        await sendList(from, TEXTOS.ventasTipo, 'Ver opciones', filas(OPC_VENTAS));
         break;
       }
       session.data.tipo_internet = tipo;
@@ -431,13 +448,7 @@ async function handleMessage(from, session, selection) {
     case 'SAC_MENU': {
       const req = OPC_SAC[selection];
       if (!req) {
-        await sendList(from, TEXTOS.sacMenu, 'Ver opciones', [
-          { id: 'sac_asesor', title: 'Contactar a un asesor' },
-          { id: 'sac_producto', title: 'Producto adicional', description: 'Adquirir un producto adicional' },
-          { id: 'sac_facturas', title: 'Consulta de facturas' },
-          { id: 'sac_soporte', title: 'Soporte Técnico' },
-          { id: 'sac_reclamo', title: 'Presentar un Reclamo' },
-        ]);
+        await sendList(from, TEXTOS.sacMenu, 'Ver opciones', filas(OPC_SAC));
         break;
       }
       await sendText(from, TEXTOS.sacCierre(req));
