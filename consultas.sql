@@ -118,7 +118,49 @@ GROUP BY dia
 ORDER BY dia DESC;
 
 -- ---------------------------------------------------------------------
--- 5. CONVERSACIONES EN CURSO (diagnóstico)
+-- 5. CONVERSACIONES (trazabilidad)
+-- Cada activación del bot genera una conversación con id propio.
+-- estado_final: completado | intervencion_asesor | reiniciado |
+--               reactivado_manual | NULL (sigue abierta)
+-- ---------------------------------------------------------------------
+
+-- Todas las conversaciones, con duración y cantidad de mensajes
+SELECT c.id, c.telefono, c.inicio, c.fin, c.estado_final,
+       c.fin - c.inicio AS duracion,
+       (SELECT COUNT(*) FROM bot.mensajes m WHERE m.conversacion_id = c.id) AS mensajes
+FROM bot.conversaciones c
+ORDER BY c.inicio DESC;
+
+-- Cuántas conversaciones por día y cómo terminaron
+SELECT inicio::date AS dia, estado_final, COUNT(*) AS total
+FROM bot.conversaciones
+GROUP BY dia, estado_final
+ORDER BY dia DESC;
+
+-- Tasa de conversión: cuántas conversaciones llegaron al final
+SELECT
+  COUNT(*) AS total_conversaciones,
+  COUNT(*) FILTER (WHERE estado_final = 'completado') AS completadas,
+  ROUND(100.0 * COUNT(*) FILTER (WHERE estado_final = 'completado') / NULLIF(COUNT(*),0), 1) AS porcentaje
+FROM bot.conversaciones;
+
+-- Cuántas requirieron que un asesor interviniera
+SELECT COUNT(*) FROM bot.conversaciones WHERE estado_final = 'intervencion_asesor';
+
+-- Historial de un cliente: todas sus conversaciones separadas
+SELECT id, inicio, fin, estado_final
+FROM bot.conversaciones
+WHERE telefono = '593958693149'
+ORDER BY inicio DESC;
+
+-- Ver una conversación completa (cambia el id)
+SELECT direccion, tipo, contenido, creado
+FROM bot.mensajes
+WHERE conversacion_id = 1
+ORDER BY creado ASC;
+
+-- ---------------------------------------------------------------------
+-- 6. SESIONES EN CURSO (diagnóstico)
 -- ---------------------------------------------------------------------
 
 -- Quién está a mitad del flujo en este momento

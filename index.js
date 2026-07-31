@@ -60,6 +60,10 @@ const TEXTOS = {
 
   sacMenu: '👇 Cuéntanos, ¿cuál es tu requerimiento?',
 
+  opcionYaUsada:
+    '⚠️ Esa opción ya fue seleccionada anteriormente.\n\n' +
+    'Por favor continúa con la última pregunta que te enviamos 👇',
+
   sacCierre: (req) =>
     `✅ Hemos registrado tu requerimiento: *${req}*.\n\n` +
     '📞 Un asesor de NETLIFE se comunicará contigo en breve.\n\n' +
@@ -167,7 +171,25 @@ async function initDb() {
     );
   `);
 
-  log('PostgreSQL conectado. Tablas listas: whatsapp_sesiones, leads, mensajes, pausas.');
+  // Cada activación del bot es una CONVERSACIÓN distinta (trazabilidad)
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS bot.conversaciones (
+      id           BIGSERIAL PRIMARY KEY,
+      telefono     TEXT NOT NULL,
+      inicio       TIMESTAMPTZ NOT NULL DEFAULT now(),
+      fin          TIMESTAMPTZ,
+      estado_final TEXT
+    );
+  `);
+  await pool.query(
+    'CREATE INDEX IF NOT EXISTS idx_conv_telefono ON bot.conversaciones (telefono, inicio DESC);'
+  );
+
+  // Enlazamos mensajes y leads a su conversación
+  await pool.query('ALTER TABLE bot.mensajes ADD COLUMN IF NOT EXISTS conversacion_id BIGINT;');
+  await pool.query('ALTER TABLE bot.leads ADD COLUMN IF NOT EXISTS conversacion_id BIGINT;');
+
+  log('PostgreSQL conectado. Tablas: whatsapp_sesiones, leads, mensajes, pausas, conversaciones.');
 }
 
 // Si una conversación queda abandonada, después de estas horas se descarta
@@ -179,6 +201,9 @@ const HORAS_PAUSA_ASESOR = 24;
 
 // Cuánto se calla el bot después de que el cliente termina el flujo
 const DIAS_PAUSA_FIN_FLUJO = 20;
+
+// Palabra clave para reactivar el bot y comprobar que está vivo
+const PALABRA_ACTIVACION = 'funel1';
 
 async function cargarSesion(telefono) {
   if (!pool) {
@@ -227,13 +252,21 @@ async function guardarLead(lead) {
     return;
   }
   await pool.query(
-    `INSERT INTO bot.leads (telefono, canal, tipo_internet, ubicacion, requerimiento)
-     VALUES ($1, $2, $3, $4, $5)`,
-    [lead.telefono, lead.canal, lead.tipo_internet || null, lead.ubicacion || null, lead.requerimiento || null]
+    `INSERT INTO bot.leads (telefono, canal, tipo_internet, ubicacion, requerimiento, conversacion_id)
+     VALUES ($1, $2, $3, $4, $5, $6)`,
+    [
+      lead.telefono,
+      lead.canal,
+      lead.tipo_internet || null,
+      lead.ubicacion || null,
+      lead.requerimiento || null,
+      lead.conversacion_id || null,
+    ]
   );
   log('    LEAD GUARDADO:', JSON.stringify(lead));
   // El cliente terminó el flujo: el bot se calla y deja el caso al asesor
   await pausar(lead.telefono, `${DIAS_PAUSA_FIN_FLUJO} days`, 'flujo completado');
+  await cerrarConversacion(lead.telefono, lead.conversacion_id, 'completado');
   await dispararWebhook(lead);
 }
 
@@ -241,8 +274,9 @@ async function guardarMensaje(telefono, direccion, tipo, contenido, wamid = null
   if (!pool) return;
   try {
     await pool.query(
-      'INSERT INTO bot.mensajes (telefono, direccion, tipo, contenido, wamid) VALUES ($1,$2,$3,$4,$5)',
-      [telefono, direccion, tipo, contenido, wamid]
+      `INSERT INTO bot.mensajes (telefono, direccion, tipo, contenido, wamid, conversacion_id)
+       VALUES ($1,$2,$3,$4,$5,$6)`,
+      [telefono, direccion, tipo, contenido, wamid, convActiva[telefono] || null]
     );
   } catch (e) {
     console.error('Error guardando mensaje:', e.message);
@@ -275,6 +309,53 @@ async function pausar(telefono, intervalo, motivo) {
     [telefono, intervalo, motivo]
   );
   log(`    BOT PAUSADO para ${telefono} por ${intervalo} (${motivo})`);
+}
+
+async function quitarPausa(telefono) {
+  if (!pool) return;
+  await pool.query('DELETE FROM bot.pausas WHERE telefono = $1', [telefono]);
+}
+
+// =====================================================================
+// CONVERSACIONES (trazabilidad: cada activación del bot es una nueva)
+// =====================================================================
+
+// Caché en memoria para etiquetar los mensajes salientes
+const convActiva = {};
+
+async function abrirConversacion(telefono) {
+  if (!pool) return null;
+  const r = await pool.query(
+    'INSERT INTO bot.conversaciones (telefono) VALUES ($1) RETURNING id',
+    [telefono]
+  );
+  const id = r.rows[0].id;
+  convActiva[telefono] = id;
+  log(`    NUEVA CONVERSACION #${id} para ${telefono}`);
+  return id;
+}
+
+async function cerrarConversacion(telefono, id, estadoFinal) {
+  delete convActiva[telefono];
+  if (!pool || !id) return;
+  await pool.query(
+    'UPDATE bot.conversaciones SET fin = now(), estado_final = $2 WHERE id = $1 AND fin IS NULL',
+    [id, estadoFinal]
+  );
+  log(`    CONVERSACION #${id} cerrada (${estadoFinal})`);
+}
+
+// Cierra la última conversación abierta de un número (cuando no tenemos el id a mano)
+async function cerrarUltimaConversacion(telefono, estadoFinal) {
+  delete convActiva[telefono];
+  if (!pool) return;
+  await pool.query(
+    `UPDATE bot.conversaciones SET fin = now(), estado_final = $2
+     WHERE id = (SELECT id FROM bot.conversaciones
+                 WHERE telefono = $1 AND fin IS NULL
+                 ORDER BY inicio DESC LIMIT 1)`,
+    [telefono, estadoFinal]
+  );
 }
 
 // ¿Ese ID de mensaje lo envió nuestro bot?
@@ -420,7 +501,9 @@ app.post('/webhook', async (req, res) => {
         const texto = eco.text?.body || `[${eco.type}]`;
         await guardarMensaje(cliente, 'asesor', eco.type, texto, eco.id);
         await pausar(cliente, `${HORAS_PAUSA_ASESOR} hours`, 'intervencion de asesor');
-        await borrarSesion(cliente); // el asesor toma el control
+        // El asesor toma el control: la conversación del bot termina aquí
+        await cerrarUltimaConversacion(cliente, 'intervencion_asesor');
+        await borrarSesion(cliente);
       }
       return;
     }
@@ -429,22 +512,6 @@ app.post('/webhook', async (req, res) => {
     if (!message) return;
 
     const from = message.from;
-
-    // ---- ¿El bot está en pausa para este número? ----
-    const pausa = await pausaActiva(from);
-    if (pausa) {
-      const hasta = new Date(pausa.pausado_hasta).toLocaleString('es-EC');
-      log(`<<< ${from} escribio, pero el BOT ESTA PAUSADO hasta ${hasta} (${pausa.motivo}). No se responde.`);
-      await guardarMensaje(
-        from,
-        'entrante',
-        message.type,
-        message.text?.body || `[${message.type}]`
-      );
-      return;
-    }
-
-    const session = await cargarSesion(from);
 
     let selection = null;
     if (message.type === 'text') {
@@ -457,18 +524,60 @@ app.post('/webhook', async (req, res) => {
       selection = `${loc.latitude}, ${loc.longitude}${loc.address ? ' - ' + loc.address : ''}`;
     }
 
-    log(`<<< ${from} | tipo: ${message.type} | estado: ${session.state} | eligio: "${selection}"`);
-    await guardarMensaje(from, 'entrante', message.type, selection);
+    const texto = (selection || '').toLowerCase().trim();
+
+    // ---- PALABRA CLAVE DE ACTIVACIÓN: reactiva el bot pase lo que pase ----
+    let forzarInicio = false;
+    if (message.type === 'text' && texto === PALABRA_ACTIVACION) {
+      log(`<<< ${from} envio "${PALABRA_ACTIVACION}": se anula la pausa y se reactiva el bot`);
+      await quitarPausa(from);
+      await cerrarUltimaConversacion(from, 'reactivado_manual');
+      await borrarSesion(from);
+      forzarInicio = true;
+    }
+
+    // ---- ¿El bot está en pausa para este número? ----
+    if (!forzarInicio) {
+      const pausa = await pausaActiva(from);
+      if (pausa) {
+        const hasta = new Date(pausa.pausado_hasta).toLocaleString('es-EC');
+        log(`<<< ${from} escribio, pero el BOT ESTA PAUSADO hasta ${hasta} (${pausa.motivo}). No se responde.`);
+        await guardarMensaje(from, 'entrante', message.type, selection);
+        return;
+      }
+    }
+
+    const session = forzarInicio ? { state: 'START', data: {} } : await cargarSesion(from);
 
     // Palabras que reinician la conversación desde cualquier punto
     const PALABRAS_REINICIO = ['menu', 'menú', 'inicio', 'hola', 'reiniciar', 'empezar'];
-    if (
-      message.type === 'text' &&
-      PALABRAS_REINICIO.includes((selection || '').toLowerCase().trim())
-    ) {
+    if (!forzarInicio && message.type === 'text' && PALABRAS_REINICIO.includes(texto)) {
       log('    Palabra de reinicio detectada, vuelve al inicio.');
+      await cerrarUltimaConversacion(from, 'reiniciado');
       session.state = 'START';
       session.data = {};
+    }
+
+    // ---- Cada arranque del flujo abre una CONVERSACIÓN nueva ----
+    if (session.state === 'START' && !session.data.conv_id) {
+      session.data.conv_id = await abrirConversacion(from);
+    } else if (session.data.conv_id) {
+      convActiva[from] = session.data.conv_id;
+    }
+
+    log(`<<< ${from} | tipo: ${message.type} | estado: ${session.state} | eligio: "${selection}"`);
+    await guardarMensaje(from, 'entrante', message.type, selection);
+
+    // ---- Bloqueo de opciones ya utilizadas ----
+    // WhatsApp no permite desactivar botones ya enviados, así que el control
+    // se hace aquí: si el cliente vuelve a tocar una opción anterior, se ignora.
+    const usadas = session.data.usadas || [];
+    if (message.type === 'interactive' && usadas.includes(selection)) {
+      log(`    Opcion "${selection}" ya fue usada antes. Se ignora y se recuerda el paso actual.`);
+      await sendText(from, TEXTOS.opcionYaUsada);
+      await repetirPasoActual(from, session);
+      await guardarSesion(from, session);
+      return;
     }
 
     await handleMessage(from, session, selection);
@@ -489,6 +598,28 @@ app.post('/webhook', async (req, res) => {
 // FLUJO DE CONVERSACIÓN
 // =====================================================================
 
+// Marca una opción como consumida para que no pueda volver a elegirse
+function marcarUsada(session, id) {
+  session.data.usadas = session.data.usadas || [];
+  if (!session.data.usadas.includes(id)) session.data.usadas.push(id);
+}
+
+// Reenvía la pregunta del paso en el que está la conversación
+async function repetirPasoActual(from, session) {
+  switch (session.state) {
+    case 'MENU_PRINCIPAL':
+      return menuPrincipal(from);
+    case 'VENTAS_TIPO':
+      return sendList(from, TEXTOS.ventasTipo, 'Ver opciones', filas(OPC_VENTAS));
+    case 'SAC_MENU':
+      return sendList(from, TEXTOS.sacMenu, 'Ver opciones', filas(OPC_SAC));
+    case 'VENTAS_UBICACION':
+      return sendText(from, TEXTOS.ventasUbicacion);
+    default:
+      return null;
+  }
+}
+
 async function handleMessage(from, session, selection) {
   switch (session.state) {
     // -------- Bienvenida + menú principal --------
@@ -501,9 +632,13 @@ async function handleMessage(from, session, selection) {
 
     case 'MENU_PRINCIPAL': {
       if (selection === 'menu_ventas') {
+        marcarUsada(session, 'menu_ventas');
+        marcarUsada(session, 'menu_sac'); // se cierra todo el menú, no solo lo elegido
         await sendList(from, TEXTOS.ventasTipo, 'Ver opciones', filas(OPC_VENTAS));
         session.state = 'VENTAS_TIPO';
       } else if (selection === 'menu_sac') {
+        marcarUsada(session, 'menu_ventas');
+        marcarUsada(session, 'menu_sac');
         await sendList(from, TEXTOS.sacMenu, 'Ver opciones', filas(OPC_SAC));
         session.state = 'SAC_MENU';
       } else {
@@ -520,6 +655,7 @@ async function handleMessage(from, session, selection) {
         await sendList(from, TEXTOS.ventasTipo, 'Ver opciones', filas(OPC_VENTAS));
         break;
       }
+      Object.keys(OPC_VENTAS).forEach((id) => marcarUsada(session, id));
       session.data.tipo_internet = tipo;
       await sendText(from, TEXTOS.ventasUbicacion);
       session.state = 'VENTAS_UBICACION';
@@ -538,6 +674,7 @@ async function handleMessage(from, session, selection) {
         canal: 'ventas',
         tipo_internet: session.data.tipo_internet,
         ubicacion: session.data.ubi,
+        conversacion_id: session.data.conv_id,
       });
       session.ended = true;
       break;
@@ -550,8 +687,14 @@ async function handleMessage(from, session, selection) {
         await sendList(from, TEXTOS.sacMenu, 'Ver opciones', filas(OPC_SAC));
         break;
       }
+      Object.keys(OPC_SAC).forEach((id) => marcarUsada(session, id));
       await sendText(from, TEXTOS.sacCierre(req));
-      await guardarLead({ telefono: from, canal: 'servicio', requerimiento: req });
+      await guardarLead({
+        telefono: from,
+        canal: 'servicio',
+        requerimiento: req,
+        conversacion_id: session.data.conv_id,
+      });
       session.ended = true;
       break;
     }
