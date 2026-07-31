@@ -358,14 +358,37 @@ async function cerrarUltimaConversacion(telefono, estadoFinal) {
   );
 }
 
+// IDs de los mensajes que acabamos de enviar. Se registran en memoria al
+// instante porque la notificación de estado puede llegar antes de que
+// termine la escritura en la base, y el bot se pausaría a sí mismo.
+const enviadosRecientes = new Set();
+
+function registrarEnvioPropio(wamid) {
+  if (!wamid) return;
+  enviadosRecientes.add(wamid);
+  // Pasada media hora ya está en la base, liberamos memoria
+  setTimeout(() => enviadosRecientes.delete(wamid), 30 * 60 * 1000);
+}
+
+const esperar = (ms) => new Promise((r) => setTimeout(r, ms));
+
 // ¿Ese ID de mensaje lo envió nuestro bot?
 async function esMensajeDelBot(wamid) {
-  if (!pool || !wamid) return false;
-  const r = await pool.query(
-    "SELECT 1 FROM bot.mensajes WHERE wamid = $1 AND direccion = 'saliente' LIMIT 1",
-    [wamid]
-  );
-  return r.rows.length > 0;
+  if (!wamid) return false;
+  if (enviadosRecientes.has(wamid)) return true;
+  if (!pool) return false;
+
+  // Dos intentos: si el estado llegó muy rápido, damos tiempo a la escritura
+  for (let intento = 0; intento < 2; intento++) {
+    const r = await pool.query(
+      "SELECT 1 FROM bot.mensajes WHERE wamid = $1 AND direccion = 'saliente' LIMIT 1",
+      [wamid]
+    );
+    if (r.rows.length > 0) return true;
+    if (enviadosRecientes.has(wamid)) return true;
+    if (intento === 0) await esperar(1500);
+  }
+  return false;
 }
 
 // =====================================================================
@@ -386,6 +409,7 @@ async function sendMessage(payload, resumen) {
     console.error('>>> ERROR AL ENVIAR:', JSON.stringify(json.error, null, 2));
   } else {
     const wamid = json.messages?.[0]?.id || null;
+    registrarEnvioPropio(wamid); // primero en memoria, sin esperar a la base
     log('>>> ENVIADO OK a', payload.to, '| tipo:', payload.type);
     // Guardamos el wamid para poder reconocer este mensaje como propio
     // cuando WhatsApp nos devuelva el eco.
@@ -504,6 +528,26 @@ app.post('/webhook', async (req, res) => {
         // El asesor toma el control: la conversación del bot termina aquí
         await cerrarUltimaConversacion(cliente, 'intervencion_asesor');
         await borrarSesion(cliente);
+      }
+      return;
+    }
+
+    // ---- ESTADOS: notificaciones de mensajes que SALIERON de nuestro número ----
+    // Incluye los que envía un asesor desde Bitrix. Si el ID no es de un envío
+    // del bot, hubo intervención humana. Solo miramos 'sent' (el primer estado)
+    // para no disparar la pausa varias veces con delivered/read.
+    const estado = value?.statuses?.[0];
+    if (estado) {
+      if (estado.status === 'sent') {
+        const propio = await esMensajeDelBot(estado.id);
+        if (!propio) {
+          const cliente = estado.recipient_id;
+          log(`<<< INTERVENCION HUMANA detectada hacia ${cliente} (mensaje ajeno ${estado.id})`);
+          await guardarMensaje(cliente, 'asesor', 'desconocido', '[mensaje enviado por un asesor]', estado.id);
+          await pausar(cliente, `${HORAS_PAUSA_ASESOR} hours`, 'intervencion de asesor');
+          await cerrarUltimaConversacion(cliente, 'intervencion_asesor');
+          await borrarSesion(cliente);
+        }
       }
       return;
     }
