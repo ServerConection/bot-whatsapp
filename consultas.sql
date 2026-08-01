@@ -160,7 +160,58 @@ WHERE conversacion_id = 1
 ORDER BY creado ASC;
 
 -- ---------------------------------------------------------------------
--- 6. SESIONES EN CURSO (diagnóstico)
+-- 6. ATRIBUCIÓN DE PAUTA (de qué anuncio vino cada cliente)
+-- origen: 'ad' = anuncio | 'post' = publicación | 'organico' = escribió directo
+-- ---------------------------------------------------------------------
+
+-- Leads con su anuncio de origen
+SELECT telefono, canal, tipo_internet, requerimiento,
+       origen, anuncio_id, anuncio_titulo, primer_mensaje, creado
+FROM bot.leads
+ORDER BY creado DESC;
+
+-- RANKING DE ANUNCIOS: cuántos leads generó cada uno
+SELECT anuncio_id, anuncio_titulo, COUNT(*) AS leads
+FROM bot.leads
+WHERE anuncio_id IS NOT NULL
+GROUP BY anuncio_id, anuncio_titulo
+ORDER BY leads DESC;
+
+-- EFECTIVIDAD POR ANUNCIO: conversaciones iniciadas vs leads cerrados
+SELECT c.anuncio_id,
+       c.anuncio_titulo,
+       COUNT(*) AS conversaciones,
+       COUNT(*) FILTER (WHERE c.estado_final = 'completado') AS leads,
+       ROUND(100.0 * COUNT(*) FILTER (WHERE c.estado_final = 'completado')
+             / NULLIF(COUNT(*),0), 1) AS tasa_conversion
+FROM bot.conversaciones c
+WHERE c.anuncio_id IS NOT NULL
+GROUP BY c.anuncio_id, c.anuncio_titulo
+ORDER BY leads DESC;
+
+-- Cuánto viene de pauta vs orgánico
+SELECT origen, COUNT(*) AS total
+FROM bot.conversaciones
+GROUP BY origen
+ORDER BY total DESC;
+
+-- Leads de pauta de los últimos 7 días, por día y anuncio
+SELECT creado::date AS dia, anuncio_titulo, COUNT(*) AS leads
+FROM bot.leads
+WHERE anuncio_id IS NOT NULL
+  AND creado >= now() - INTERVAL '7 days'
+GROUP BY dia, anuncio_titulo
+ORDER BY dia DESC, leads DESC;
+
+-- Con qué mensaje entran los clientes (útil para detectar textos de anuncios)
+SELECT primer_mensaje, COUNT(*) AS veces
+FROM bot.conversaciones
+GROUP BY primer_mensaje
+ORDER BY veces DESC
+LIMIT 30;
+
+-- ---------------------------------------------------------------------
+-- 7. SESIONES EN CURSO (diagnóstico)
 -- ---------------------------------------------------------------------
 
 -- Quién está a mitad del flujo en este momento

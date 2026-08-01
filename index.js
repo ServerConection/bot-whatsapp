@@ -189,6 +189,24 @@ async function initDb() {
   await pool.query('ALTER TABLE bot.mensajes ADD COLUMN IF NOT EXISTS conversacion_id BIGINT;');
   await pool.query('ALTER TABLE bot.leads ADD COLUMN IF NOT EXISTS conversacion_id BIGINT;');
 
+  // --- ORIGEN DEL CLIENTE (atribución de pauta) ---
+  // Primer mensaje con el que entró y datos del anuncio de Click-to-WhatsApp
+  const columnasOrigen = `
+    ADD COLUMN IF NOT EXISTS primer_mensaje TEXT,
+    ADD COLUMN IF NOT EXISTS origen         TEXT,
+    ADD COLUMN IF NOT EXISTS anuncio_id     TEXT,
+    ADD COLUMN IF NOT EXISTS anuncio_titulo TEXT,
+    ADD COLUMN IF NOT EXISTS anuncio_cuerpo TEXT,
+    ADD COLUMN IF NOT EXISTS anuncio_url    TEXT,
+    ADD COLUMN IF NOT EXISTS ctwa_clid      TEXT
+  `;
+  await pool.query(`ALTER TABLE bot.conversaciones ${columnasOrigen};`);
+  await pool.query(`ALTER TABLE bot.leads ${columnasOrigen};`);
+  await pool.query(
+    'CREATE INDEX IF NOT EXISTS idx_conv_anuncio ON bot.conversaciones (anuncio_id);'
+  );
+  await pool.query('CREATE INDEX IF NOT EXISTS idx_leads_anuncio ON bot.leads (anuncio_id);');
+
   log('PostgreSQL conectado. Tablas: whatsapp_sesiones, leads, mensajes, pausas, conversaciones.');
 }
 
@@ -251,9 +269,12 @@ async function guardarLead(lead) {
     log('    (sin BD) LEAD:', JSON.stringify(lead));
     return;
   }
+  const o = lead.origen || {};
   await pool.query(
-    `INSERT INTO bot.leads (telefono, canal, tipo_internet, ubicacion, requerimiento, conversacion_id)
-     VALUES ($1, $2, $3, $4, $5, $6)`,
+    `INSERT INTO bot.leads
+       (telefono, canal, tipo_internet, ubicacion, requerimiento, conversacion_id,
+        primer_mensaje, origen, anuncio_id, anuncio_titulo, anuncio_cuerpo, anuncio_url, ctwa_clid)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)`,
     [
       lead.telefono,
       lead.canal,
@@ -261,6 +282,13 @@ async function guardarLead(lead) {
       lead.ubicacion || null,
       lead.requerimiento || null,
       lead.conversacion_id || null,
+      o.primer_mensaje || null,
+      o.origen || null,
+      o.anuncio_id || null,
+      o.anuncio_titulo || null,
+      o.anuncio_cuerpo || null,
+      o.anuncio_url || null,
+      o.ctwa_clid || null,
     ]
   );
   log('    LEAD GUARDADO:', JSON.stringify(lead));
@@ -323,15 +351,55 @@ async function quitarPausa(telefono) {
 // Caché en memoria para etiquetar los mensajes salientes
 const convActiva = {};
 
-async function abrirConversacion(telefono) {
+// Extrae el origen del cliente a partir del primer mensaje.
+// Si viene de un anuncio de Click-to-WhatsApp, WhatsApp adjunta 'referral'.
+function extraerOrigen(message) {
+  const texto =
+    message?.text?.body ||
+    message?.interactive?.button_reply?.title ||
+    message?.interactive?.list_reply?.title ||
+    `[${message?.type || 'desconocido'}]`;
+
+  const ref = message?.referral;
+  if (!ref) {
+    return { primer_mensaje: texto, origen: 'organico' };
+  }
+
+  return {
+    primer_mensaje: texto,
+    origen: ref.source_type || 'anuncio', // 'ad' o 'post'
+    anuncio_id: ref.source_id || null,
+    anuncio_titulo: ref.headline || null,
+    anuncio_cuerpo: ref.body || null,
+    anuncio_url: ref.source_url || null,
+    ctwa_clid: ref.ctwa_clid || null,
+  };
+}
+
+async function abrirConversacion(telefono, origen = {}) {
   if (!pool) return null;
   const r = await pool.query(
-    'INSERT INTO bot.conversaciones (telefono) VALUES ($1) RETURNING id',
-    [telefono]
+    `INSERT INTO bot.conversaciones
+       (telefono, primer_mensaje, origen, anuncio_id, anuncio_titulo, anuncio_cuerpo, anuncio_url, ctwa_clid)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING id`,
+    [
+      telefono,
+      origen.primer_mensaje || null,
+      origen.origen || null,
+      origen.anuncio_id || null,
+      origen.anuncio_titulo || null,
+      origen.anuncio_cuerpo || null,
+      origen.anuncio_url || null,
+      origen.ctwa_clid || null,
+    ]
   );
   const id = r.rows[0].id;
   convActiva[telefono] = id;
-  log(`    NUEVA CONVERSACION #${id} para ${telefono}`);
+  if (origen.anuncio_id) {
+    log(`    NUEVA CONVERSACION #${id} para ${telefono} | ANUNCIO: ${origen.anuncio_id} "${origen.anuncio_titulo || ''}"`);
+  } else {
+    log(`    NUEVA CONVERSACION #${id} para ${telefono} | origen: ${origen.origen || 'desconocido'}`);
+  }
   return id;
 }
 
@@ -603,8 +671,11 @@ app.post('/webhook', async (req, res) => {
     }
 
     // ---- Cada arranque del flujo abre una CONVERSACIÓN nueva ----
+    // Aquí capturamos el primer mensaje y, si viene de pauta, los datos del anuncio.
     if (session.state === 'START' && !session.data.conv_id) {
-      session.data.conv_id = await abrirConversacion(from);
+      const origen = extraerOrigen(message);
+      session.data.origen = origen; // se arrastra hasta el lead
+      session.data.conv_id = await abrirConversacion(from, origen);
     } else if (session.data.conv_id) {
       convActiva[from] = session.data.conv_id;
     }
@@ -719,6 +790,7 @@ async function handleMessage(from, session, selection) {
         tipo_internet: session.data.tipo_internet,
         ubicacion: session.data.ubi,
         conversacion_id: session.data.conv_id,
+        origen: session.data.origen,
       });
       session.ended = true;
       break;
@@ -738,6 +810,7 @@ async function handleMessage(from, session, selection) {
         canal: 'servicio',
         requerimiento: req,
         conversacion_id: session.data.conv_id,
+        origen: session.data.origen,
       });
       session.ended = true;
       break;
