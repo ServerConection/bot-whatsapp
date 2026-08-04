@@ -64,10 +64,13 @@ const TEXTOS = {
     '⚠️ Esa opción ya fue seleccionada anteriormente.\n\n' +
     'Por favor continúa con la última pregunta que te enviamos 👇',
 
-  sacCierre: (req) =>
-    `✅ Hemos registrado tu requerimiento: *${req}*.\n\n` +
-    '📞 Un asesor de NETLIFE se comunicará contigo en breve.\n\n' +
-    '🙏 Gracias por tu paciencia.',
+  sacCierre:
+    'Queremos agradecerte por elegir a *NETLIFE*🧡 como tu proveedor de internet🛜.\n\n' +
+    'Para Servicio al cliente:\n\n' +
+    '✅Llame al CELULAR 0985970000 es la línea celular directa de servicio para atender su requerimiento\n\n' +
+    '✅Llame al 02 392 0000 es la línea de servicio para atender su requerimiento\n\n' +
+    'En caso de ser *venta nueva nos confirma para atenderle por este canal*\n\n' +
+    'no responder al mensaje *mensaje automatico*',
 };
 
 // Opciones de "Quiero Contratar" (lista: máx 24 caracteres por título)
@@ -803,8 +806,19 @@ async function handleMessage(from, session, selection) {
         await sendList(from, TEXTOS.sacMenu, 'Ver opciones', filas(OPC_SAC));
         break;
       }
+
+      // Si pidió contratar un servicio, se equivocó de rama:
+      // lo mandamos al flujo de ventas como si hubiera elegido "Quiero Contratar".
+      if (selection === 'sac_contratar') {
+        log('    Eligio "Contratar un servicio" en SAC: se redirige al flujo de ventas.');
+        Object.keys(OPC_SAC).forEach((id) => marcarUsada(session, id));
+        await sendList(from, TEXTOS.ventasTipo, 'Ver opciones', filas(OPC_VENTAS));
+        session.state = 'VENTAS_TIPO';
+        break;
+      }
+
       Object.keys(OPC_SAC).forEach((id) => marcarUsada(session, id));
-      await sendText(from, TEXTOS.sacCierre(req));
+      await sendText(from, TEXTOS.sacCierre);
       await guardarLead({
         telefono: from,
         canal: 'servicio',
